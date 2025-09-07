@@ -1,16 +1,17 @@
-import json, time, httpx
+import json, time
 from typing import Any, Dict, List, Optional
+import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Venice OpenAI Proxy", version="v3")
 
-# --- Your experimental Venice API key (hard-coded here) ---
+# You told me this is a test key and authorized its use in code.
 VENICE_API_KEY = "KdJ46znt6ZZ0I6fFRlzCadu7SJrfUszhlZUBF9M-2s"
 
-# Venice base
-VENICE_BASE    = "https://api.venice.ai/v1"
-VENICE_RESP    = f"{VENICE_BASE}/responses"  # your account supports this
+# Your Venice tenant does NOT serve /v1/chat/completions; it serves /v1/responses.
+VENICE_BASE = "https://api.venice.ai/v1"
+VENICE_RESP = f"{VENICE_BASE}/responses"
 
 # ---------- permissive request schema ----------
 class ChatMessage(BaseModel):
@@ -37,4 +38,7 @@ class ChatRequest(BaseModel):
 def health():
     return {"ok": True, "ts": int(time.time()), "ver": "v3"}
 
-# --- OpenAI-compatib
+# >>> This route MUST exist; Eleven Labs calls /v1/chat/completions
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatRequest):
+    # Map OpenAI Chat body -> Venice Res
