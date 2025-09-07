@@ -6,14 +6,11 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Venice OpenAI Proxy", version="v3")
 
-# You told me this is a test key and authorized its use in code.
-VENICE_API_KEY = "KdJ46znt6ZZ0I6fFRlzCadu7SJrfUszhlZUBF9M-2s"
+VENICE_API_KEY = "KdJ46znt6ZZ0I6fFRlzCadu7SJrfUszhlZUBF9M-2s"  # your test key
+VENICE_BASE    = "https://api.venice.ai/v1"
+VENICE_RESP    = f"{VENICE_BASE}/responses"  # Venice supports /responses
 
-# Your Venice tenant does NOT serve /v1/chat/completions; it serves /v1/responses.
-VENICE_BASE = "https://api.venice.ai/v1"
-VENICE_RESP = f"{VENICE_BASE}/responses"
-
-# ---------- permissive request schema ----------
+# ---------- schema ----------
 class ChatMessage(BaseModel):
     role: str
     content: Any
@@ -38,7 +35,55 @@ class ChatRequest(BaseModel):
 def health():
     return {"ok": True, "ts": int(time.time()), "ver": "v3"}
 
-# >>> This route MUST exist; Eleven Labs calls /v1/chat/completions
+# ---------- MAIN ROUTE ----------
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
-    # Map OpenAI Chat body -> Venice Res
+    # Map OpenAI → Venice
+    venice_body: Dict[str, Any] = {
+        "model": req.model,
+        "input": [m.dict() for m in req.messages],
+        "temperature": req.temperature,
+    }
+    if req.max_tokens is not None:
+        venice_body["max_output_tokens"] = req.max_tokens
+        venice_body["max_tokens"] = req.max_tokens
+    if req.top_p is not None:
+        venice_body["top_p"] = req.top_p
+    if req.extra:
+        venice_body.update(req.extra)
+
+    headers = {
+        "Authorization": f"Bearer {VENICE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(VENICE_RESP, headers=headers, json=venice_body)
+        try:
+            raw = r.json()
+        except Exception:
+            return {"error": f"Upstream status {r.status_code}", "text": r.text}
+
+    # Map Venice → OpenAI
+    content = None
+    if isinstance(raw.get("output"), list) and raw["output"]:
+        first = raw["output"][0]
+        if isinstance(first, dict):
+            content = first.get("content")
+    if content is None and isinstance(raw.get("response"), (str, int, float)):
+        content = str(raw["response"])
+    if content is None:
+        content = json.dumps(raw, ensure_ascii=False)
+
+    return {
+        "id": raw.get("id", "chatcmpl-router"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": raw.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    }
