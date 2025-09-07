@@ -1,15 +1,16 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel, Field
+import json, time, httpx
 from typing import Any, Dict, List, Optional
-import httpx, os, re, time
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
-app = FastAPI()
+app = FastAPI(title="Venice OpenAI Proxy", version="v3")
 
-# --- CONFIG ---
-VENICE_API_KEY = os.getenv("VENICE_API_KEY", "").strip()
-# Your tenant returns 404 on /chat/completions; use Responses API:
-VENICE_BASE = "https://api.venice.ai/v1"
-VENICE_RESPONSES_URL = f"{VENICE_BASE}/responses"
+# --- Your experimental Venice API key (hard-coded here) ---
+VENICE_API_KEY = "KdJ46znt6ZZ0I6fFRlzCadu7SJrfUszhlZUBF9M-2s"
+
+# Venice base
+VENICE_BASE    = "https://api.venice.ai/v1"
+VENICE_RESP    = f"{VENICE_BASE}/responses"  # your account supports this
 
 # ---------- permissive request schema ----------
 class ChatMessage(BaseModel):
@@ -30,52 +31,10 @@ class ChatRequest(BaseModel):
     tool_choice: Optional[Any] = None
     user: Optional[str] = None
     extra: Dict[str, Any] = Field(default_factory=dict)
-
-    class Config:
-        extra = "allow"
-
-# ---------- simple router (optional) ----------
-NSFW_HINTS = re.compile(
-    r"(nsfw|explicit|porn|sexual|domme|findom|humiliat|degrad|edg(?:e|ing)|"
-    r"orgasm|chastit|cbt|sissy|feet|heels|submiss|mistress|obey|kneel|pathetic|"
-    r"worthless|good\s+girl)",
-    re.IGNORECASE,
-)
-ANALYTIC_HINTS = re.compile(
-    r"(reason|analy|explain|compare|contrast|evaluate|step-by-step|tradeoff|"
-    r"limitations|design)",
-    re.IGNORECASE,
-)
-
-DEFAULT_MODEL = "llama-3.3-70b"
-NSFW_MODEL   = "venice-uncensored"
-SMART_MODEL  = "qwen3-235b"
-
-def _pull_user_text(messages: List[ChatMessage]) -> str:
-    chunks: List[str] = []
-    for m in messages:
-        if m.role != "user":
-            continue
-        if isinstance(m.content, str):
-            chunks.append(m.content)
-        elif isinstance(m.content, list):
-            for part in m.content:
-                if isinstance(part, dict) and "text" in part:
-                    chunks.append(str(part["text"]))
-    return " ".join(chunks)[:10000]
-
-def choose_model(req: ChatRequest) -> str:
-    if req.model and req.model.lower() != "auto":
-        return req.model
-    txt = _pull_user_text(req.messages)
-    if NSFW_HINTS.search(txt):
-        return NSFW_MODEL
-    if ANALYTIC_HINTS.search(txt) or len(txt) > 1200:
-        return SMART_MODEL
-    return DEFAULT_MODEL
+    class Config: extra = "allow"
 
 @app.get("/health")
-async def health():
-    return {"ok": True, "ts": int(time.time()), "ver": "sanitized-v3"}
+def health():
+    return {"ok": True, "ts": int(time.time()), "ver": "v3"}
 
-# ------
+# --- OpenAI-compatib
