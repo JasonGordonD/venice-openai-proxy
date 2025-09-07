@@ -1,13 +1,15 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 import httpx, os, re, time
 
-# Create FastAPI app
 app = FastAPI()
 
-VENICE_API_KEY = os.getenv("VENICE_API_KEY")
-VENICE_BASE_URL = "https://api.venice.ai/api/v1/chat/completions"
+# --- CONFIG ---
+VENICE_API_KEY = os.getenv("VENICE_API_KEY", "").strip()
+# Your tenant returns 404 on /chat/completions; use Responses API:
+VENICE_BASE = "https://api.venice.ai/v1"
+VENICE_RESPONSES_URL = f"{VENICE_BASE}/responses"
 
 # ---------- permissive request schema ----------
 class ChatMessage(BaseModel):
@@ -32,7 +34,7 @@ class ChatRequest(BaseModel):
     class Config:
         extra = "allow"
 
-# ---------- simple router ----------
+# ---------- simple router (optional) ----------
 NSFW_HINTS = re.compile(
     r"(nsfw|explicit|porn|sexual|domme|findom|humiliat|degrad|edg(?:e|ing)|"
     r"orgasm|chastit|cbt|sissy|feet|heels|submiss|mistress|obey|kneel|pathetic|"
@@ -50,7 +52,7 @@ NSFW_MODEL   = "venice-uncensored"
 SMART_MODEL  = "qwen3-235b"
 
 def _pull_user_text(messages: List[ChatMessage]) -> str:
-    chunks = []
+    chunks: List[str] = []
     for m in messages:
         if m.role != "user":
             continue
@@ -74,55 +76,6 @@ def choose_model(req: ChatRequest) -> str:
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "ts": int(time.time()), "ver": "sanitized-v2"}
+    return {"ok": True, "ts": int(time.time()), "ver": "sanitized-v3"}
 
-# ---------- sanitized handler ----------
-@app.post("/chat/completions")
-async def chat_completion(req: ChatRequest):
-    # pick the target model (respects explicit model unless "auto")
-    target_model = choose_model(req)
-
-    # dual auth headers: some Venice stacks prefer x-api-key
-    headers = {
-        "Authorization": f"Bearer {VENICE_API_KEY}",
-        "x-api-key": VENICE_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    # base payload
-    payload: Dict[str, Any] = {
-        "model": target_model,
-        "messages": [m.dict() for m in req.messages],
-        "temperature": req.temperature,
-    }
-
-    # pass through common OpenAI-style optional fields if present
-    for k in ("max_tokens", "top_p", "stream", "stop",
-              "response_format", "tools", "tool_choice", "user"):
-        v = getattr(req, k, None)
-        if v is not None:
-            payload[k] = v
-
-    # include any extra fields captured by the permissive schema
-    if req.extra:
-        payload.update(req.extra)
-
-    # call Venice
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(VENICE_BASE_URL, headers=headers, json=payload)
-        try:
-            raw = r.json()
-        except Exception:
-            # forward upstream error text for debugging
-            return {"error": f"Upstream status {r.status_code}", "text": r.text}
-
-    # ---- sanitize to pure OpenAI schema (what ElevenLabs expects) ----
-    clean: Dict[str, Any] = {
-        "id": raw.get("id"),
-        "object": raw.get("object", "chat.completion"),
-        "created": raw.get("created"),
-        "model": raw.get("model", target_model),
-        "choices": raw.get("choices", []),
-        "usage": raw.get("usage", {}),
-    }
-    return clean
+# ------
