@@ -36,4 +36,5 @@ async def chat_completion(req: ChatRequest):
         "choices": raw.get("choices", []),
         "usage": raw.get("usage", {}),
     }
+
     return clean
