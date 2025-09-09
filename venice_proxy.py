@@ -1,3 +1,12 @@
+# venice_proxy.py
+# ROV-M + RIGOR: OpenAI-compatible proxy to Venice for ElevenLabs Agents.
+# - Cleans ElevenLabs payloads (tools:null -> [], strips stream_options/input/etc.).
+# - Removes any 'assistant' turns before the first 'user' turn (keep 'system').
+# - Coerces non-string message content to string.
+# - Returns strict OpenAI chat.completions JSON.
+# - Forwards real upstream error status codes (no 200-wrapping on errors).
+# - Defaults to NON-STREAMING for safer ElevenLabs integration (override via PROXY_FORCE_NON_STREAM=0).
+
 import os
 import json
 import time
@@ -12,7 +21,7 @@ from pydantic import BaseModel, Field
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v9")
+app = FastAPI(title="Venice OpenAI Proxy", version="v9.1")
 
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
 VENICE_ENDPOINT: str = os.getenv(
@@ -20,7 +29,7 @@ VENICE_ENDPOINT: str = os.getenv(
     "https://api.venice.ai/api/v1/chat/completions",
 ).strip()
 
-# 1 = force non-streaming replies (safer with some clients, e.g., ElevenLabs)
+# Force non-streaming replies by default (safer with some clients).
 PROXY_FORCE_NON_STREAM: bool = os.getenv("PROXY_FORCE_NON_STREAM", "1").strip() not in ("0", "false", "False")
 
 HTTPX_TIMEOUT: float = float(os.getenv("HTTPX_TIMEOUT", "60"))
@@ -83,7 +92,7 @@ class ChatRequest(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v9"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v9.1"}
 
 
 # ------------------------------------------------------------------------------
@@ -100,7 +109,10 @@ def _coerce_messages_to_strings(messages: List[Dict[str, Any]]) -> List[Dict[str
                 content = json.dumps(content, ensure_ascii=False)
             except Exception:
                 content = str(content)
-        out.append({"role": role, "content": content, **({"name": m["name"]} if "name" in m and m["name"] is not None else {})})
+        entry: Dict[str, Any] = {"role": role, "content": content}
+        if "name" in m and m["name"] is not None:
+            entry["name"] = m["name"]
+        out.append(entry)
     return out
 
 
@@ -126,11 +138,28 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     if body.get("user") is None:
         body.pop("user", None)
 
-    # If first message is assistant before any user, drop it (some backends reject it)
+    # Enforce: any 'assistant' messages BEFORE the first 'user' are dropped (keep 'system')
     msgs = body.get("messages")
     if isinstance(msgs, list) and msgs:
-        if msgs[0].get("role") == "assistant":
-            msgs.pop(0)
+        cleaned: List[Dict[str, Any]] = []
+        seen_user = False
+        for m in msgs:
+            role = m.get("role")
+            if role == "system":
+                cleaned.append(m)  # always keep system preface
+                continue
+            if role == "user":
+                seen_user = True
+                cleaned.append(m)
+                continue
+            if role == "assistant":
+                if seen_user:
+                    cleaned.append(m)  # assistant replies only after first user turn
+                # else: drop assistant seed before any user
+                continue
+            # pass through unknown roles defensively
+            cleaned.append(m)
+        body["messages"] = cleaned
 
     # Drop any top-level keys with explicit None
     for k in [k for k, v in body.items() if v is None]:
@@ -182,40 +211,6 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     return body
 
 
-def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
-    """
-    Always return strict OpenAI-compatible JSON (chat.completion).
-    """
-    # If already OpenAI-shaped with choices, pass through
-    choices = up_json.get("choices")
-    if isinstance(choices, list):
-        # Trim Venice-specific extras from choices[0] if present
-        try:
-            for c in choices:
-                if "message" in c and isinstance(c["message"], dict):
-                    # Ensure only role/content remain
-                    msg = c["message"]
-                    role = msg.get("role", "assistant")
-                    content = msg.get("content")
-                    if content is None:
-                        # Try to extract a fallback
-                        content = json.dumps(up_json, ensure_ascii=False)
-                    c["message"] = {"role": role, "content": content}
-                # Remove non-OpenAI keys if present
-                for bad in ("refusal", "annotations", "audio", "function_call", "tool_calls", "reasoning_content", "stop_reason"):
-                    c.pop(bad, None)
-            # Remove non-OpenAI top-level keys commonly seen
-            for bad in ("service_tier", "system_fingerprint", "prompt_logprobs", "kv_transfer_params", "venice_parameters"):
-                up_json.pop(bad, None)
-        except Exception:
-            # If sanitization fails, fall back to wrapping
-            return _wrap_minimal(up_json, model)
-        return up_json
-
-    # Not OpenAI-shaped → wrap minimally
-    return _wrap_minimal(up_json, model)
-
-
 def _wrap_minimal(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
     """Minimal wrapper to OpenAI chat.completion shape."""
     content: Optional[str] = None
@@ -241,14 +236,55 @@ def _wrap_minimal(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop"
+                "finish_reason": "stop",
             }
         ],
         "usage": up_json.get(
             "usage",
-            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        )
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        ),
     }
+
+
+def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """
+    Always return strict OpenAI-compatible JSON (chat.completion).
+    """
+    choices = up_json.get("choices")
+    if isinstance(choices, list):
+        # Sanitize choices/messages and remove non-OpenAI keys
+        try:
+            for c in choices:
+                if "message" in c and isinstance(c["message"], dict):
+                    msg = c["message"]
+                    role = msg.get("role", "assistant")
+                    content = msg.get("content")
+                    if content is None:
+                        content = json.dumps(up_json, ensure_ascii=False)
+                    c["message"] = {"role": role, "content": content}
+                for bad in (
+                    "refusal",
+                    "annotations",
+                    "audio",
+                    "function_call",
+                    "tool_calls",
+                    "reasoning_content",
+                    "stop_reason",
+                ):
+                    c.pop(bad, None)
+            for bad in (
+                "service_tier",
+                "system_fingerprint",
+                "prompt_logprobs",
+                "kv_transfer_params",
+                "venice_parameters",
+            ):
+                up_json.pop(bad, None)
+        except Exception:
+            return _wrap_minimal(up_json, model)
+        return up_json
+
+    return _wrap_minimal(up_json, model)
 
 
 async def _headers() -> Dict[str, str]:
@@ -280,8 +316,7 @@ async def chat_completions(req: ChatRequest):
                 ) as r:
                     logging.info("[proxy] POST %s -> %s (stream)", VENICE_ENDPOINT, r.status_code)
                     async for chunk in r.aiter_raw():
-                        # Pass upstream SSE through unchanged
-                        yield chunk
+                        yield chunk  # pass upstream SSE through unchanged
             except httpx.HTTPError as e:
                 logging.exception("Upstream stream error: %s", e)
                 yield b'data: {"error":"Upstream stream failed"}\n\n'
@@ -335,4 +370,3 @@ async def chat_completions(req: ChatRequest):
             status_code=502,
             media_type="application/json",
         )
-
