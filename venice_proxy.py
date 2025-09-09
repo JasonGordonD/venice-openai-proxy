@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Venice OpenAI Proxy", version="v6")
 
 # Your test key (you authorized using it in code)
-VENICE_API_KEY = os.getenv("VENICE_API_KEY", "KdJ46znt6ZZ0I6fFRlzCadu7SJrfUszhlZUBF9M-2s").strip()
+VENICE_API_KEY = os.getenv("VENICE_API_KEY", "AQ2DDZvJa00kgvEg9LFpiBmNsTz1HMKuEwEtrgjJPU-2s").strip()
 
 # If Venice later tells you the exact path, set this in Render → Environment
 VENICE_ENDPOINT = os.getenv("VENICE_ENDPOINT", "").strip()
