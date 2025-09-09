@@ -1,14 +1,14 @@
 # venice_proxy.py
-# FINAL (v13): OpenAI-compatible proxy to Venice for ElevenLabs Agents.
-# - Cleans ElevenLabs payloads (drops/normalizes tools, stream_options, input, etc.).
+# FINAL (v14): OpenAI-compatible proxy to Venice for ElevenLabs Agents.
+# - Cleans ElevenLabs payloads (drops unknown keys like additionalProp1, stream_options, tool_choice, input, etc.).
 # - Coerces invalid roles (e.g., "string") to "user"; drops assistant turns before first user.
 # - Coerces non-string message content to strings.
 # - Forces NON-STREAMING replies (stable for ElevenLabs, which often sets stream:true).
-# - Adds safe defaults: model fallback to DEFAULT_MODEL (venice-uncensored).
-# - Returns strict OpenAI chat.completions JSON (or wraps Venice responses into that shape).
+# - Falls back to DEFAULT_MODEL when model is missing/placeholder "string".
+# - Returns strict OpenAI chat.completions JSON (or wraps Venice responses to that shape).
 # - Forwards real upstream HTTP status codes, logs upstream error text & duration.
-# - Root (/) + HEAD and /health + HEAD return 200 to avoid probe “server error” banners.
-# - Optional: disable Venice default system prompt via VENICE_DISABLE_SYSTEM_PROMPT=1.
+# - Root (/) + HEAD and /health + HEAD return 200 to satisfy probes.
+# - Optionally disable Venice default system prompt via VENICE_DISABLE_SYSTEM_PROMPT=1.
 
 import os
 import json
@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v13")
+app = FastAPI(title="Venice OpenAI Proxy", version="v14")
 
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
 VENICE_ENDPOINT: str = os.getenv(
@@ -52,6 +52,31 @@ logging.basicConfig(level=logging.INFO)
 
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
+# Only these top-level keys are forwarded to Venice:
+ALLOWED_TOP_KEYS = {
+    "model",
+    "messages",
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "stream",
+    "stop",
+    "user",
+    "tools",
+    # Venice-specific:
+    "venice_parameters",
+    # Common OpenAI-compatible tuning fields (safe to forward if present):
+    "n",
+    "seed",
+    "logprobs",
+    "logit_bias",
+    "presence_penalty",
+    "frequency_penalty",
+    "metadata",
+    # Note: response_format/tool_choice are intentionally filtered earlier
+    # to avoid Venice validation issues; keep them out by default.
+}
+
 
 @app.on_event("startup")
 async def _startup() -> None:
@@ -70,14 +95,14 @@ async def _shutdown() -> None:
 
 
 # ------------------------------------------------------------------------------
-# Models (permissive; keep unknown keys)
+# Models (permissive; keep unknown keys in Pydantic, but we later filter)
 # ------------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
     content: Any
     name: Optional[str] = None
 
-    model_config = {"extra": "allow"}  # retain unknown per-message keys
+    model_config = {"extra": "allow"}
 
 
 class ChatRequest(BaseModel):
@@ -92,10 +117,10 @@ class ChatRequest(BaseModel):
     tools: Optional[Any] = None
     tool_choice: Optional[Any] = None
     user: Optional[str] = None
-    # Allow arbitrary extra keys (e.g., ElevenLabs may add stream_options)
+    # Allow arbitrary extra keys (e.g., ElevenLabs may add stream_options, elevenlabs_extra_body)
     extra: Dict[str, Any] = Field(default_factory=dict)
 
-    model_config = {"extra": "allow"}  # retain unknown top-level keys
+    model_config = {"extra": "allow"}
 
 
 # ------------------------------------------------------------------------------
@@ -103,7 +128,7 @@ class ChatRequest(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v13"}
+    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v14"}
 
 
 @app.head("/")
@@ -113,7 +138,7 @@ async def head_root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v13"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v14"}
 
 
 @app.head("/health")
@@ -187,9 +212,14 @@ def _normalize_roles_and_prune(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any
             if seen_user:
                 cleaned.append(m)
             continue
-        # allow 'tool' or unknown future roles to pass
+        # allow 'tool' (or future roles) to pass
         cleaned.append(m)
     return cleaned
+
+
+def _filter_allowed_top_keys(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop any unknown top-level keys Venice doesn't expect (e.g., additionalProp1, elevenlabs_extra_body)."""
+    return {k: v for k, v in body.items() if k in ALLOWED_TOP_KEYS}
 
 
 def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -198,7 +228,7 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     AND ElevenLabs UI doesn't error on tool/stream mismatches.
     """
     # Remove fields Venice doesn't accept on chat/completions
-    for k in ("stream_options", "tool_choice", "input", "max_output_tokens"):
+    for k in ("stream_options", "tool_choice", "input", "max_output_tokens", "elevenlabs_extra_body"):
         body.pop(k, None)
 
     # tools: keep only if it's a non-empty list; otherwise remove
@@ -226,6 +256,8 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     for k in [k for k, v in body.items() if v is None]:
         body.pop(k, None)
 
+    # Keep only allowed top-level keys (this removes unknowns like "additionalProp1")
+    body = _filter_allowed_top_keys(body)
     return body
 
 
@@ -233,6 +265,7 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     """
     Build the OpenAI-style request body for Venice chat/completions.
     Always force non-streaming (stable for ElevenLabs).
+    Only forward an explicit allowlist of keys.
     """
     body: Dict[str, Any] = {
         "model": _normalize_model(req.model),
@@ -247,23 +280,11 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     if isinstance(req.stop, (list, str)):
         body["stop"] = req.stop
 
-    # Merge unknown top-level fields retained by pydantic (extra=allow)
-    as_dict = req.model_dump()
-    for k, v in as_dict.items():
-        if k not in body and k not in (
-            "messages", "temperature", "max_tokens", "top_p", "stop", "stream", "model", "extra"
-        ):
-            body[k] = v
-
-    # Merge explicit "extra" bag
-    if req.extra:
-        body.update(req.extra)
-
     # Optional: disable Venice default system prompt via env
     if VENICE_DISABLE_SYSTEM_PROMPT:
         body["venice_parameters"] = {"include_venice_system_prompt": False}
 
-    # Normalize & coerce
+    # Normalize & coerce and drop unknown keys
     return _strip_problem_fields(body)
 
 
