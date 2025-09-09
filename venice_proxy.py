@@ -1,36 +1,33 @@
 # venice_proxy.py
-# ROV-M + RIGOR: OpenAI-compatible proxy to Venice for ElevenLabs Agents.
+# FINAL (v10): OpenAI-compatible proxy to Venice for ElevenLabs Agents.
 # - Cleans ElevenLabs payloads (drops tools when null/empty; strips stream_options/input/etc.).
 # - Removes any 'assistant' turns before the first 'user' turn (keeps 'system').
 # - Coerces non-string message content to string.
+# - Forces NON-STREAMING replies (simplifies ElevenLabs integration).
 # - Returns strict OpenAI chat.completions JSON.
 # - Forwards real upstream error status codes (no 200-wrapping on errors).
-# - Defaults to NON-STREAMING for safer ElevenLabs integration (override via PROXY_FORCE_NON_STREAM=0).
+# - Root (/) returns 200 to avoid 404 noise in logs.
 
 import os
 import json
 import time
 import logging
-from typing import Any, Dict, List, Optional, AsyncIterator
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v9.2")
+app = FastAPI(title="Venice OpenAI Proxy", version="v10")
 
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
 VENICE_ENDPOINT: str = os.getenv(
     "VENICE_ENDPOINT",
     "https://api.venice.ai/api/v1/chat/completions",
 ).strip()
-
-# Force non-streaming replies by default (safer with some clients).
-PROXY_FORCE_NON_STREAM: bool = os.getenv("PROXY_FORCE_NON_STREAM", "1").strip() not in ("0", "false", "False")
 
 HTTPX_TIMEOUT: float = float(os.getenv("HTTPX_TIMEOUT", "60"))
 
@@ -74,7 +71,7 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
-    stream: Optional[bool] = False
+    stream: Optional[bool] = False  # will be force-disabled
     stop: Optional[Any] = None
     response_format: Optional[Dict[str, Any]] = None
     tools: Optional[Any] = None
@@ -88,11 +85,15 @@ class ChatRequest(BaseModel):
 
 
 # ------------------------------------------------------------------------------
-# Health
+# Health & Root (stop 404 noise)
 # ------------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v10"}
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v9.2"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v10"}
 
 
 # ------------------------------------------------------------------------------
@@ -177,11 +178,13 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
 def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     """
     Build the OpenAI-style request body for Venice chat/completions.
+    ALWAYS forces non-streaming to stabilize ElevenLabs integration.
     """
     body: Dict[str, Any] = {
         "model": req.model,
         "messages": [m.dict() for m in req.messages] if req.messages else [],
         "temperature": req.temperature,
+        "stream": False,  # <--- FORCE NON-STREAMING
     }
 
     if req.max_tokens is not None:
@@ -190,9 +193,6 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
         body["top_p"] = req.top_p
     if isinstance(req.stop, (list, str)):
         body["stop"] = req.stop
-    if req.stream is not None:
-        # Optionally force non-streaming to simplify ElevenLabs integration
-        body["stream"] = False if PROXY_FORCE_NON_STREAM else bool(req.stream)
 
     # Merge unknown top-level fields from pydantic dict
     as_dict = req.dict()
@@ -308,22 +308,7 @@ async def chat_completions(req: ChatRequest):
 
     logging.info("[proxy] forwarding to %s", VENICE_ENDPOINT)
 
-    # Streaming pass-through (optional; disabled by default via PROXY_FORCE_NON_STREAM)
-    if body.get("stream") is True:
-        async def stream_gen() -> AsyncIterator[bytes]:
-            try:
-                async with _client.stream(
-                    "POST", VENICE_ENDPOINT, headers=headers, json=body
-                ) as r:
-                    logging.info("[proxy] POST %s -> %s (stream)", VENICE_ENDPOINT, r.status_code)
-                    async for chunk in r.aiter_raw():
-                        yield chunk  # pass upstream SSE through unchanged
-            except httpx.HTTPError as e:
-                logging.exception("Upstream stream error: %s", e)
-                yield b'data: {"error":"Upstream stream failed"}\n\n'
-        return StreamingResponse(stream_gen(), media_type="text/event-stream")
-
-    # Non-streaming path (default/safe)
+    # Non-streaming path (forced)
     try:
         r = await _client.post(VENICE_ENDPOINT, headers=headers, json=body)
         status = r.status_code
