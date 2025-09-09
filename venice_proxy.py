@@ -1,12 +1,13 @@
 # venice_proxy.py
-# FINAL (v11): OpenAI-compatible proxy to Venice for ElevenLabs Agents.
+# FINAL (v12): OpenAI-compatible proxy to Venice for ElevenLabs Agents.
 # - Cleans ElevenLabs payloads (drops tools when null/empty; strips stream_options/input/etc.).
 # - Removes any 'assistant' turns before the first 'user' (keeps 'system').
 # - Coerces non-string message content to string.
-# - Forces NON-STREAMING replies (stable for ElevenLabs).
+# - Forces NON-STREAMING replies (stable for ElevenLabs dashboard which always sends stream:true).
 # - Returns strict OpenAI chat.completions JSON.
-# - Forwards real upstream error status codes and logs upstream error text & duration.
-# - Root (/) and HEAD (/) return 200 to avoid probe failures.
+# - Forwards real upstream HTTP status codes and logs upstream error text & duration.
+# - Root (/) and HEAD (/) return 200 to avoid probe-based “server error”.
+# - Optional: inject Venice-specific venice_parameters via env to disable their default system prompt.
 
 import os
 import json
@@ -21,15 +22,24 @@ from pydantic import BaseModel, Field
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v11")
+app = FastAPI(title="Venice OpenAI Proxy", version="v12")
 
+# Required for upstream calls
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
+
+# Venice Chat Completions endpoint (OpenAI-compatible)
 VENICE_ENDPOINT: str = os.getenv(
     "VENICE_ENDPOINT",
     "https://api.venice.ai/api/v1/chat/completions",
 ).strip()
 
+# Timeout for upstream HTTP calls (seconds)
 HTTPX_TIMEOUT: float = float(os.getenv("HTTPX_TIMEOUT", "60"))
+
+# Optional: set to 1/true to drop Venice default system prompt
+VENICE_DISABLE_SYSTEM_PROMPT: bool = os.getenv(
+    "VENICE_DISABLE_SYSTEM_PROMPT", "0"
+).strip() not in ("0", "false", "False")
 
 if not VENICE_API_KEY:
     logging.warning("VENICE_API_KEY is not set; upstream calls will fail with 401")
@@ -38,6 +48,8 @@ if not VENICE_ENDPOINT:
     VENICE_ENDPOINT = "https://api.venice.ai/api/v1/chat/completions"
 
 _client: Optional[httpx.AsyncClient] = None
+
+logging.basicConfig(level=logging.INFO)
 
 
 @app.on_event("startup")
@@ -51,18 +63,20 @@ async def _shutdown() -> None:
     global _client
     if _client is not None:
         try:
-            await _client.aclose()
+            await _client.close()
         finally:
             _client = None
 
 
 # ------------------------------------------------------------------------------
-# Models
+# Models (permissive; keep unknown keys)
 # ------------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
     content: Any
     name: Optional[str] = None
+
+    model_config = {"extra": "allow"}  # keep unknown message keys if present
 
 
 class ChatRequest(BaseModel):
@@ -71,16 +85,16 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
-    stream: Optional[bool] = False  # forced off
+    stream: Optional[bool] = False  # will be forced False when forwarding
     stop: Optional[Any] = None
     response_format: Optional[Dict[str, Any]] = None
     tools: Optional[Any] = None
     tool_choice: Optional[Any] = None
     user: Optional[str] = None
+    # Allow arbitrary extra keys (e.g., ElevenLabs may add stream_options)
     extra: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        extra = "allow"
+    model_config = {"extra": "allow"}  # keep unknown top-level keys
 
 
 # ------------------------------------------------------------------------------
@@ -88,7 +102,7 @@ class ChatRequest(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v11"}
+    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v12"}
 
 @app.head("/")
 async def head_root():
@@ -96,7 +110,7 @@ async def head_root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v11"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v12"}
 
 @app.head("/health")
 async def head_health():
@@ -107,6 +121,7 @@ async def head_health():
 # Sanitizers & Builders
 # ------------------------------------------------------------------------------
 def _coerce_messages_to_strings(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure every message.content is a string; stringify objects/arrays for safety."""
     out: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
@@ -122,17 +137,22 @@ def _coerce_messages_to_strings(messages: List[Dict[str, Any]]) -> List[Dict[str
         out.append(entry)
     return out
 
+
 def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize the incoming payload so Venice /chat/completions accepts it
+    AND ElevenLabs UI doesn't error on tool/stream mismatches.
+    """
     # Remove fields Venice doesn't accept on chat/completions
     for k in ("stream_options", "tool_choice", "input", "max_output_tokens"):
         body.pop(k, None)
 
-    # tools: remove when null or []
+    # tools: remove when null or [] (venice-uncensored doesn't do function calling)
     tools_val = body.get("tools", None)
     if tools_val is None or (isinstance(tools_val, list) and len(tools_val) == 0):
         body.pop("tools", None)
 
-    # response_format: null or dict schema -> remove while debugging
+    # response_format: null or dict schema -> remove
     rf = body.get("response_format")
     if rf is None or isinstance(rf, dict):
         body.pop("response_format", None)
@@ -173,12 +193,17 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return body
 
+
 def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
+    """
+    Build the OpenAI-style request body for Venice chat/completions.
+    Always force non-streaming (stable for ElevenLabs).
+    """
     body: Dict[str, Any] = {
         "model": req.model,
-        "messages": [m.dict() for m in req.messages] if req.messages else [],
+        "messages": [m.model_dump() for m in req.messages] if req.messages else [],
         "temperature": req.temperature,
-        "stream": False,  # force non-streaming
+        "stream": False,  # force non-streaming for EL stability
     }
     if req.max_tokens is not None:
         body["max_tokens"] = req.max_tokens
@@ -187,26 +212,42 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     if isinstance(req.stop, (list, str)):
         body["stop"] = req.stop
 
-    as_dict = req.dict()
+    # Merge unknown top-level fields retained by pydantic (extra=allow)
+    as_dict = req.model_dump()  # includes allowed extras
     for k, v in as_dict.items():
-        if k not in body and k not in ("messages","temperature","max_tokens","top_p","stop","stream","model","extra"):
+        if k not in body and k not in (
+            "messages", "temperature", "max_tokens", "top_p", "stop",
+            "stream", "model", "extra"
+        ):
             body[k] = v
 
+    # Merge explicit "extra" bag
     if req.extra:
         body.update(req.extra)
 
+    # Optional: disable Venice default system prompt via env
+    if VENICE_DISABLE_SYSTEM_PROMPT:
+        body["venice_parameters"] = {"include_venice_system_prompt": False}
+
+    # Normalize & coerce
     return _strip_problem_fields(body)
 
+
 def _wrap_minimal(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Minimal wrapper to strict OpenAI chat.completion shape."""
     content: Optional[str] = None
+
     if "output" in up_json:
         out = up_json["output"]
         if isinstance(out, list) and out and isinstance(out[0], dict):
             content = out[0].get("content")
+
     if content is None and "response" in up_json:
         content = str(up_json["response"])
+
     if content is None:
         content = json.dumps(up_json, ensure_ascii=False)
+
     return {
         "id": up_json.get("id", f"chatcmpl-proxy-{int(time.time())}"),
         "object": "chat.completion",
@@ -218,7 +259,12 @@ def _wrap_minimal(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
         "usage": up_json.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
     }
 
+
 def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """
+    Sanitize upstream OpenAI-shaped responses; otherwise wrap minimally.
+    Ensures choices[].message has only role/content and removes Venice extras.
+    """
     choices = up_json.get("choices")
     if isinstance(choices, list):
         try:
@@ -230,9 +276,11 @@ def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
                     if content is None:
                         content = json.dumps(up_json, ensure_ascii=False)
                     c["message"] = {"role": role, "content": content}
-                for bad in ("refusal","annotations","audio","function_call","tool_calls","reasoning_content","stop_reason"):
+                # Remove non-OpenAI keys if present
+                for bad in ("refusal", "annotations", "audio", "function_call", "tool_calls", "reasoning_content", "stop_reason"):
                     c.pop(bad, None)
-            for bad in ("service_tier","system_fingerprint","prompt_logprobs","kv_transfer_params","venice_parameters"):
+            # Remove Venice-specific top-level extras if present
+            for bad in ("service_tier", "system_fingerprint", "prompt_logprobs", "kv_transfer_params", "venice_parameters"):
                 up_json.pop(bad, None)
         except Exception:
             return _wrap_minimal(up_json, model)
@@ -255,12 +303,26 @@ async def chat_completions(req: ChatRequest, request: Request):
     global _client
     assert _client is not None, "HTTP client not initialized"
 
+    # Build & sanitize body
     body = _build_chat_body(req)
+
+    # Log a concise, safe summary of what we received vs forward
+    try:
+        incoming = await request.json()
+    except Exception:
+        incoming = {}
+    logging.info(
+        "[proxy] incoming stream=%s tools=%s first_role=%s  -> forward stream=%s tools=%s",
+        incoming.get("stream", None),
+        "present" if incoming.get("tools") else ("null" if "tools" in incoming else "absent"),
+        (incoming.get("messages") or [{}])[0].get("role") if isinstance(incoming.get("messages"), list) and incoming["messages"] else None,
+        body.get("stream"),
+        "present" if body.get("tools") else "absent",
+    )
+
     headers = await _headers()
 
     t0 = time.perf_counter()
-    logging.info("[proxy] forwarding to %s", VENICE_ENDPOINT)
-
     try:
         r = await _client.post(VENICE_ENDPOINT, headers=headers, json=body)
         dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -272,7 +334,9 @@ async def chat_completions(req: ChatRequest, request: Request):
             try:
                 up_json = r.json()
             except Exception:
-                return Response(content=await r.aread(), status_code=status, media_type=ctype)
+                # Forward raw if upstream is non-JSON (unlikely for Venice)
+                raw = await r.aread()
+                return Response(content=raw, status_code=status, media_type=ctype)
             out_json = _as_openai(up_json, req.model)
             return Response(
                 content=json.dumps(out_json, ensure_ascii=False).encode("utf-8"),
@@ -280,9 +344,12 @@ async def chat_completions(req: ChatRequest, request: Request):
                 media_type="application/json",
             )
 
-        # Error path: log upstream text snippet, return real status
+        # Error: log upstream text & return real status
         txt = await r.aread()
-        logging.error("[proxy] upstream error %s in %dms: %s", status, dt_ms, txt[:500].decode("utf-8","ignore"))
+        logging.error(
+            "[proxy] upstream error %s in %dms: %s",
+            status, dt_ms, txt[:500].decode("utf-8", "ignore")
+        )
         err = {
             "error": "Upstream failed",
             "detail": {
@@ -300,4 +367,16 @@ async def chat_completions(req: ChatRequest, request: Request):
     except httpx.HTTPError as e:
         logging.exception("Upstream call failed: %s", e)
         err = {"error": "Upstream failed", "detail": {"exception": str(e), "_url": VENICE_ENDPOINT}}
-        return Response(content=json.dumps(err, ensure_ascii=False).encode("utf-8"), status_code=502, media_type="application/json")
+        return Response(
+            content=json.dumps(err, ensure_ascii=False).encode("utf-8"),
+            status_code=502,
+            media_type="application/json",
+        )
+
+
+# ------------------------------------------------------------------------------
+# Local dev entrypoint
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("venice_proxy:app", host="0.0.0.0", port=int(os.getenv("PORT", "8013")))
