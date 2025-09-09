@@ -64,19 +64,30 @@ async def health():
 def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize the incoming OpenAI-style payload so Venice /chat/completions accepts it.
-    Removes or fixes fields that caused 400 in your logs:
+    Removes or fixes fields that caused 400s:
       - tools: null -> remove (or keep [] if already list)
       - remove stream_options/tool_choice/input/max_output_tokens
+      - remove response_format when null or object (schema) while debugging
+      - remove user when null (Venice expects string if present)
+      - drop any top-level keys that are explicitly None
       - optionally drop an initial assistant message on first turn
     """
-    # Drop fields Venice doesn't accept on /chat/completions
+    # Drop fields Venice doesn't accept on /chat/completions outright
     for k in ("stream_options", "tool_choice", "input", "max_output_tokens"):
-        if k in body:
-            body.pop(k, None)
+        body.pop(k, None)
 
-    # tools: null → remove
-    if "tools" in body and body["tools"] is None:
+    # tools: null → remove (if a list, it's okay to keep; but model may not use tools)
+    if body.get("tools", "__absent__") is None:
         body.pop("tools", None)
+
+    # response_format: null → remove; if it's a dict (schema), drop while debugging
+    rf = body.get("response_format", "__absent__")
+    if rf is None or isinstance(rf, dict):
+        body.pop("response_format", None)
+
+    # user: null → remove (Venice expects a string if present)
+    if body.get("user", "__absent__") is None:
+        body.pop("user", None)
 
     # If messages exist and the very first message is "assistant" (before any user), drop it.
     msgs = body.get("messages")
@@ -84,11 +95,10 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
         if msgs[0].get("role") == "assistant":
             msgs.pop(0)
 
-    # If response_format is a dict with schema, Venice may reject; remove while debugging.
-    rf = body.get("response_format")
-    if isinstance(rf, dict) and rf:
-        # leave JSON mode etc. for later; safest is to drop for now
-        body.pop("response_format", None)
+    # As a final guard, drop any top-level keys that are explicitly None
+    null_keys = [k for k, v in body.items() if v is None]
+    for k in null_keys:
+        body.pop(k, None)
 
     return body
 
@@ -104,20 +114,19 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     if req.top_p is not None:
         body["top_p"] = req.top_p
     if isinstance(req.stop, (list, str)) or req.stop is None:
-        # leave stop as-is if list/str/None; Venice follows OpenAI here
         if req.stop is not None:
             body["stop"] = req.stop
     if req.stream is not None:
         body["stream"] = bool(req.stream)
 
-    # Merge any unknown fields, then strip the problem ones
-    # (req.extra collects only top-level "extra", but Config.extra="allow" preserves others in __dict__)
-    # So also merge anything else that might have been set at top-level.
+    # Merge any unknown fields from the pydantic model dict (Config.extra="allow")
     as_dict = req.dict()
-    # Known top-level keys already handled; pick up potential extras like stream_options if they landed there
     for k, v in as_dict.items():
-        if k not in body and k not in ("messages", "temperature", "max_tokens", "top_p", "stop", "stream", "model", "extra"):
+        if k not in body and k not in (
+            "messages", "temperature", "max_tokens", "top_p", "stop", "stream", "model", "extra"
+        ):
             body[k] = v
+
     # Also merge explicit "extra" bag
     if req.extra:
         body.update(req.extra)
@@ -131,11 +140,8 @@ def _as_openai_if_needed(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
     Otherwise, wrap minimally into OpenAI chat.completion shape.
     """
     if "choices" in up_json and isinstance(up_json["choices"], list):
-        # Already OpenAI-compatible; pass through
         return up_json
 
-    # Minimal adapter if Venice responds in a different shape
-    # Try to find content
     content = None
     if "output" in up_json:
         out = up_json["output"]
@@ -178,40 +184,32 @@ async def chat_completions(req: ChatRequest):
     body = _build_chat_body(req)
     headers = await _headers()
 
-    # Log a concise line so you can see status in Render logs
     logging.info("[proxy] forwarding to %s", VENICE_ENDPOINT)
 
-    # If client asked for streaming, stream upstream SSE back to client.
+    # Streaming pass-through
     if body.get("stream") is True:
         async def stream_gen() -> AsyncIterator[bytes]:
             try:
                 async with client.stream("POST", VENICE_ENDPOINT, headers=headers, json=body) as r:
                     logging.info("[proxy] POST %s -> %s (stream)", VENICE_ENDPOINT, r.status_code)
                     async for chunk in r.aiter_raw():
-                        # pass upstream SSE as-is
                         yield chunk
             except httpx.HTTPError as e:
                 logging.exception("Upstream stream error: %s", e)
-                # Emit a minimal SSE error
                 yield b'data: {"error":"Upstream stream failed"}\n\n'
-
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
-    # Non-streaming request
+    # Non-streaming
     try:
         r = await client.post(VENICE_ENDPOINT, headers=headers, json=body)
         status = r.status_code
         logging.info("[proxy] POST %s -> %s", VENICE_ENDPOINT, status)
-
-        # Forward upstream content-type when possible
         ctype = r.headers.get("content-type", "application/json")
 
-        # On success, return JSON (wrapping if needed)
         if 200 <= status < 300:
             try:
                 up_json = r.json()
             except Exception:
-                # If upstream returned non-JSON, forward raw
                 return Response(content=await r.aread(), status_code=status, media_type=ctype)
             return Response(
                 content=json.dumps(_as_openai_if_needed(up_json, req.model)).encode("utf-8"),
@@ -219,7 +217,6 @@ async def chat_completions(req: ChatRequest):
                 media_type="application/json"
             )
 
-        # On error, forward Venice error with small envelope
         txt = await r.aread()
         err = {
             "error": "Upstream failed",
