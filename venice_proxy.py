@@ -1,14 +1,9 @@
 # venice_proxy.py
-# FINAL (v14): OpenAI-compatible proxy to Venice for ElevenLabs Agents.
-# - Cleans ElevenLabs payloads (drops unknown keys like additionalProp1, stream_options, tool_choice, input, etc.).
-# - Coerces invalid roles (e.g., "string") to "user"; drops assistant turns before first user.
-# - Coerces non-string message content to strings.
-# - Forces NON-STREAMING replies (stable for ElevenLabs, which often sets stream:true).
-# - Falls back to DEFAULT_MODEL when model is missing/placeholder "string".
-# - Returns strict OpenAI chat.completions JSON (or wraps Venice responses to that shape).
-# - Forwards real upstream HTTP status codes, logs upstream error text & duration.
-# - Root (/) + HEAD and /health + HEAD return 200 to satisfy probes.
-# - Optionally disable Venice default system prompt via VENICE_DISABLE_SYSTEM_PROMPT=1.
+# FINAL (v15) — OpenAI-compatible proxy to Venice for ElevenLabs Agents.
+# Fixes: clamps invalid top_p (e.g., 0.0) and temperature ranges; drops unknown keys;
+# coerces message content to strings; removes tools=null; removes response_format
+# when null/object; forces non-streaming; fixes invalid roles; returns strict
+# chat.completions JSON; provides 200 on GET/HEAD / and /health.
 
 import os
 import json
@@ -23,14 +18,14 @@ from pydantic import BaseModel, Field
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v14")
+app = FastAPI(title="Venice OpenAI Proxy", version="v15")
 
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
 VENICE_ENDPOINT: str = os.getenv(
     "VENICE_ENDPOINT", "https://api.venice.ai/api/v1/chat/completions"
 ).strip()
 
-# Model fallback if incoming model is missing/placeholder/invalid
+# Fallback model if incoming model is missing/placeholder/invalid
 DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "venice-uncensored").strip()
 
 # Timeout for upstream HTTP calls (seconds)
@@ -44,15 +39,12 @@ VENICE_DISABLE_SYSTEM_PROMPT: bool = os.getenv(
 if not VENICE_API_KEY:
     logging.warning("VENICE_API_KEY is not set; upstream calls will fail with 401")
 
-if not VENICE_ENDPOINT:
-    VENICE_ENDPOINT = "https://api.venice.ai/api/v1/chat/completions"
-
 _client: Optional[httpx.AsyncClient] = None
 logging.basicConfig(level=logging.INFO)
 
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
-# Only these top-level keys are forwarded to Venice:
+# Allow only these top-level keys to reach Venice
 ALLOWED_TOP_KEYS = {
     "model",
     "messages",
@@ -63,9 +55,9 @@ ALLOWED_TOP_KEYS = {
     "stop",
     "user",
     "tools",
-    # Venice-specific:
+    # Venice-specific
     "venice_parameters",
-    # Common OpenAI-compatible tuning fields (safe to forward if present):
+    # Common OpenAI-compatible tuning fields (safe if present)
     "n",
     "seed",
     "logprobs",
@@ -73,8 +65,6 @@ ALLOWED_TOP_KEYS = {
     "presence_penalty",
     "frequency_penalty",
     "metadata",
-    # Note: response_format/tool_choice are intentionally filtered earlier
-    # to avoid Venice validation issues; keep them out by default.
 }
 
 
@@ -95,7 +85,7 @@ async def _shutdown() -> None:
 
 
 # ------------------------------------------------------------------------------
-# Models (permissive; keep unknown keys in Pydantic, but we later filter)
+# Models (permissive; we sanitize before forwarding)
 # ------------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
@@ -111,24 +101,23 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
-    stream: Optional[bool] = False   # will be forced False for EL stability
+    stream: Optional[bool] = False
     stop: Optional[Any] = None
     response_format: Optional[Dict[str, Any]] = None
     tools: Optional[Any] = None
     tool_choice: Optional[Any] = None
     user: Optional[str] = None
-    # Allow arbitrary extra keys (e.g., ElevenLabs may add stream_options, elevenlabs_extra_body)
-    extra: Dict[str, Any] = Field(default_factory=dict)
+    extra: Dict[str, Any] = Field(default_factory=dict)  # keep unknowns around
 
     model_config = {"extra": "allow"}
 
 
 # ------------------------------------------------------------------------------
-# Root, Health, HEADs (avoid probe failures)
+# Root & Health & HEAD (keep probes green)
 # ------------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v14"}
+    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v15"}
 
 
 @app.head("/")
@@ -138,7 +127,7 @@ async def head_root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v14"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v15"}
 
 
 @app.head("/health")
@@ -150,9 +139,6 @@ async def head_health():
 # Sanitizers & Builders
 # ------------------------------------------------------------------------------
 def _normalize_model(model: Any) -> str:
-    """
-    Use DEFAULT_MODEL if model is missing, not a string, blank, or the swagger placeholder "string".
-    """
     if not isinstance(model, str):
         return DEFAULT_MODEL
     m = model.strip()
@@ -162,7 +148,6 @@ def _normalize_model(model: Any) -> str:
 
 
 def _coerce_messages_to_strings(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Ensure every message.content is a string; stringify objects/arrays safely."""
     out: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
@@ -180,12 +165,7 @@ def _coerce_messages_to_strings(messages: List[Dict[str, Any]]) -> List[Dict[str
 
 
 def _normalize_roles_and_prune(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    - Coerce invalid roles to 'user'.
-    - Always keep 'system'.
-    - Keep 'assistant' only after the first 'user' has appeared.
-    """
-    # Coerce invalid roles
+    # Coerce invalid roles → "user"
     tmp: List[Dict[str, Any]] = []
     for m in msgs:
         role = m.get("role")
@@ -196,52 +176,68 @@ def _normalize_roles_and_prune(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any
         m2["role"] = role
         tmp.append(m2)
 
-    # Prune assistant before first user
+    # Drop assistant turns that come before the first user
     cleaned: List[Dict[str, Any]] = []
     seen_user = False
     for m in tmp:
         role = m["role"]
         if role == "system":
             cleaned.append(m)
-            continue
-        if role == "user":
+        elif role == "user":
             seen_user = True
             cleaned.append(m)
-            continue
-        if role == "assistant":
+        elif role == "assistant":
             if seen_user:
                 cleaned.append(m)
-            continue
-        # allow 'tool' (or future roles) to pass
-        cleaned.append(m)
+        else:  # allow 'tool' or any future role to pass
+            cleaned.append(m)
     return cleaned
 
 
+def _normalize_sampling(body: Dict[str, Any]) -> None:
+    # temperature clamp to [0, 2] or default to 0.7
+    if "temperature" in body:
+        t = body["temperature"]
+        if not isinstance(t, (int, float)):
+            body["temperature"] = 0.7
+        else:
+            if t < 0:
+                body["temperature"] = 0.0
+            elif t > 2:
+                body["temperature"] = 2.0
+
+    # top_p must be in (0, 1]; if invalid (e.g., 0.0 or >1), set safe default 0.95
+    if "top_p" in body:
+        p = body["top_p"]
+        if not isinstance(p, (int, float)) or p <= 0 or p > 1:
+            body["top_p"] = 0.95
+
+    # max_tokens must be positive int; else drop
+    if "max_tokens" in body:
+        mt = body["max_tokens"]
+        if not isinstance(mt, int) or mt <= 0:
+            body.pop("max_tokens", None)
+
+    # stop must be str or list; else drop
+    if "stop" in body and not isinstance(body["stop"], (str, list)):
+        body.pop("stop", None)
+
+
 def _filter_allowed_top_keys(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop any unknown top-level keys Venice doesn't expect (e.g., additionalProp1, elevenlabs_extra_body)."""
     return {k: v for k, v in body.items() if k in ALLOWED_TOP_KEYS}
 
 
 def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize incoming payload so Venice /chat/completions accepts it
-    AND ElevenLabs UI doesn't error on tool/stream mismatches.
-    """
     # Remove fields Venice doesn't accept on chat/completions
-    for k in ("stream_options", "tool_choice", "input", "max_output_tokens", "elevenlabs_extra_body"):
+    for k in ("stream_options", "tool_choice", "input", "max_output_tokens", "elevenlabs_extra_body", "response_format"):
         body.pop(k, None)
 
-    # tools: keep only if it's a non-empty list; otherwise remove
+    # tools: keep only non-empty list; otherwise remove
     tools_val = body.get("tools", None)
     if not isinstance(tools_val, list) or len(tools_val) == 0:
         body.pop("tools", None)
 
-    # response_format: null or dict schema -> remove (avoid Venice validation issues)
-    rf = body.get("response_format")
-    if rf is None or isinstance(rf, dict):
-        body.pop("response_format", None)
-
-    # user: null -> remove
+    # user: null → remove
     if body.get("user") is None:
         body.pop("user", None)
 
@@ -252,21 +248,19 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
         msgs = _coerce_messages_to_strings(msgs)
         body["messages"] = msgs
 
+    # Sampling normalization (fixes top_p=0.0, invalid temperature, etc.)
+    _normalize_sampling(body)
+
     # Drop explicit None keys
     for k in [k for k, v in body.items() if v is None]:
         body.pop(k, None)
 
-    # Keep only allowed top-level keys (this removes unknowns like "additionalProp1")
+    # Keep only allowed top-level keys (removes unknowns like "additionalProp1")
     body = _filter_allowed_top_keys(body)
     return body
 
 
 def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
-    """
-    Build the OpenAI-style request body for Venice chat/completions.
-    Always force non-streaming (stable for ElevenLabs).
-    Only forward an explicit allowlist of keys.
-    """
     body: Dict[str, Any] = {
         "model": _normalize_model(req.model),
         "messages": [m.model_dump() for m in req.messages] if req.messages else [],
@@ -280,16 +274,14 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
     if isinstance(req.stop, (list, str)):
         body["stop"] = req.stop
 
-    # Optional: disable Venice default system prompt via env
+    # Optionally disable Venice default system prompt via env
     if VENICE_DISABLE_SYSTEM_PROMPT:
         body["venice_parameters"] = {"include_venice_system_prompt": False}
 
-    # Normalize & coerce and drop unknown keys
     return _strip_problem_fields(body)
 
 
 def _wrap_minimal(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
-    """Minimal wrapper to strict OpenAI chat.completion shape."""
     content: Optional[str] = None
 
     if "output" in up_json:
@@ -316,10 +308,6 @@ def _wrap_minimal(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
 
 
 def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
-    """
-    Sanitize upstream OpenAI-shaped responses; otherwise wrap minimally.
-    Ensures choices[].message has only role/content and removes Venice extras.
-    """
     choices = up_json.get("choices")
     if isinstance(choices, list):
         try:
@@ -331,10 +319,8 @@ def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
                     if content is None:
                         content = json.dumps(up_json, ensure_ascii=False)
                     c["message"] = {"role": role, "content": content}
-                # Remove non-OpenAI keys if present
                 for bad in ("refusal", "annotations", "audio", "function_call", "tool_calls", "reasoning_content", "stop_reason"):
                     c.pop(bad, None)
-            # Remove Venice-specific top-level extras if present
             for bad in ("service_tier", "system_fingerprint", "prompt_logprobs", "kv_transfer_params", "venice_parameters"):
                 up_json.pop(bad, None)
         except Exception:
@@ -355,13 +341,11 @@ async def _headers() -> Dict[str, str]:
 # ------------------------------------------------------------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
-    global _client
     assert _client is not None, "HTTP client not initialized"
 
-    # Build & sanitize body
     body = _build_chat_body(req)
 
-    # Log a concise, safe summary of what we received vs forward
+    # Minimal log of inbound vs forwarded (safe)
     try:
         incoming = await request.json()
     except Exception:
@@ -371,18 +355,18 @@ async def chat_completions(req: ChatRequest, request: Request):
     if isinstance(imsgs, list) and imsgs:
         first_role = imsgs[0].get("role")
     logging.info(
-        "[proxy] incoming stream=%s tools=%s first_role=%s  -> forward model=%s stream=%s tools=%s",
+        "[proxy] incoming stream=%s top_p=%s first_role=%s -> forward model=%s stream=%s top_p=%s",
         incoming.get("stream", None),
-        "present" if incoming.get("tools") else ("null" if "tools" in incoming else "absent"),
+        incoming.get("top_p", None),
         first_role,
         body.get("model"),
         body.get("stream"),
-        "present" if body.get("tools") else "absent",
+        body.get("top_p", None),
     )
 
     headers = await _headers()
-
     t0 = time.perf_counter()
+
     try:
         r = await _client.post(VENICE_ENDPOINT, headers=headers, json=body)
         dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -403,7 +387,6 @@ async def chat_completions(req: ChatRequest, request: Request):
                 media_type="application/json",
             )
 
-        # Error: log upstream text & return real status
         txt = await r.aread()
         logging.error(
             "[proxy] upstream error %s in %dms: %s",
