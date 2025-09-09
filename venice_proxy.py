@@ -1,7 +1,7 @@
 # venice_proxy.py
 # ROV-M + RIGOR: OpenAI-compatible proxy to Venice for ElevenLabs Agents.
-# - Cleans ElevenLabs payloads (tools:null -> [], strips stream_options/input/etc.).
-# - Removes any 'assistant' turns before the first 'user' turn (keep 'system').
+# - Cleans ElevenLabs payloads (drops tools when null/empty; strips stream_options/input/etc.).
+# - Removes any 'assistant' turns before the first 'user' turn (keeps 'system').
 # - Coerces non-string message content to string.
 # - Returns strict OpenAI chat.completions JSON.
 # - Forwards real upstream error status codes (no 200-wrapping on errors).
@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v9.1")
+app = FastAPI(title="Venice OpenAI Proxy", version="v9.2")
 
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
 VENICE_ENDPOINT: str = os.getenv(
@@ -92,7 +92,7 @@ class ChatRequest(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v9.1"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v9.2"}
 
 
 # ------------------------------------------------------------------------------
@@ -119,15 +119,16 @@ def _coerce_messages_to_strings(messages: List[Dict[str, Any]]) -> List[Dict[str
 def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize the incoming payload so Venice /chat/completions accepts it
-    AND ElevenLabs UI doesn't error on tool serialization mismatches.
+    AND ElevenLabs UI doesn't error on serialization mismatches.
     """
     # Remove fields Venice doesn't accept on chat/completions
     for k in ("stream_options", "tool_choice", "input", "max_output_tokens"):
         body.pop(k, None)
 
-    # Normalize tools: null -> [] (keep array if already present)
-    if body.get("tools") is None:
-        body["tools"] = []
+    # tools: remove entirely when null or empty (venice-uncensored is non-tools)
+    tools_val = body.get("tools", None)
+    if tools_val is None or (isinstance(tools_val, list) and len(tools_val) == 0):
+        body.pop("tools", None)
 
     # response_format: null or dict schema -> remove while debugging
     rf = body.get("response_format")
@@ -343,8 +344,9 @@ async def chat_completions(req: ChatRequest):
                 media_type="application/json",
             )
 
-        # Forward real status code on errors (no 200-wrapping)
+        # Forward real status code on errors (no 200-wrapping) and log upstream text (first 500 chars)
         txt = await r.aread()
+        logging.error("[proxy] upstream error %s: %s", status, txt[:500].decode("utf-8", "ignore"))
         err = {
             "error": "Upstream failed",
             "detail": {
