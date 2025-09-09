@@ -1,31 +1,32 @@
 # venice_proxy.py
-# FINAL (v15) — OpenAI-compatible proxy to Venice for ElevenLabs Agents.
-# Fixes: clamps invalid top_p (e.g., 0.0) and temperature ranges; drops unknown keys;
-# coerces message content to strings; removes tools=null; removes response_format
-# when null/object; forces non-streaming; fixes invalid roles; returns strict
-# chat.completions JSON; provides 200 on GET/HEAD / and /health.
+# FINAL (v16) — OpenAI-compatible proxy to Venice for ElevenLabs Agents.
+# - Streaming: pass-through SSE when stream=true, JSON when stream=false
+# - Payload hardening: clamp top_p/temperature, drop unknown keys, tools:null -> drop,
+#   response_format null/object -> drop, map user_id->user, fix roles, content->string
+# - Fallback model if "string"/blank, clean HEAD/GET / and /health to 200
 
 import os
 import json
 import time
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Response, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # ------------------------------------------------------------------------------
 # App & Config
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Venice OpenAI Proxy", version="v15")
+app = FastAPI(title="Venice OpenAI Proxy", version="v16")
 
 VENICE_API_KEY: str = os.getenv("VENICE_API_KEY", "").strip()
 VENICE_ENDPOINT: str = os.getenv(
     "VENICE_ENDPOINT", "https://api.venice.ai/api/v1/chat/completions"
 ).strip()
 
-# Fallback model if incoming model is missing/placeholder/invalid
+# If the incoming model is missing/placeholder, use this one:
 DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "venice-uncensored").strip()
 
 # Timeout for upstream HTTP calls (seconds)
@@ -39,12 +40,12 @@ VENICE_DISABLE_SYSTEM_PROMPT: bool = os.getenv(
 if not VENICE_API_KEY:
     logging.warning("VENICE_API_KEY is not set; upstream calls will fail with 401")
 
-_client: Optional[httpx.AsyncClient] = None
 logging.basicConfig(level=logging.INFO)
+_client: Optional[httpx.AsyncClient] = None
 
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
-# Allow only these top-level keys to reach Venice
+# Only allow these top-level keys to reach Venice
 ALLOWED_TOP_KEYS = {
     "model",
     "messages",
@@ -55,9 +56,9 @@ ALLOWED_TOP_KEYS = {
     "stop",
     "user",
     "tools",
-    # Venice-specific
+    # Venice-specific:
     "venice_parameters",
-    # Common OpenAI-compatible tuning fields (safe if present)
+    # OpenAI-compatible extras (safe if present):
     "n",
     "seed",
     "logprobs",
@@ -96,7 +97,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
@@ -107,7 +108,10 @@ class ChatRequest(BaseModel):
     tools: Optional[Any] = None
     tool_choice: Optional[Any] = None
     user: Optional[str] = None
-    extra: Dict[str, Any] = Field(default_factory=dict)  # keep unknowns around
+    # ElevenLabs sometimes sends this; map to OpenAI "user"
+    user_id: Optional[str] = None
+    # Allow arbitrary extra keys (e.g., stream_options, elevenlabs_extra_body)
+    extra: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "allow"}
 
@@ -117,7 +121,7 @@ class ChatRequest(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v15"}
+    return {"status": "ok", "service": "Venice OpenAI Proxy", "version": "v16"}
 
 
 @app.head("/")
@@ -127,7 +131,7 @@ async def head_root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": int(time.time()), "version": "v15"}
+    return {"status": "ok", "ts": int(time.time()), "version": "v16"}
 
 
 @app.head("/health")
@@ -189,13 +193,13 @@ def _normalize_roles_and_prune(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any
         elif role == "assistant":
             if seen_user:
                 cleaned.append(m)
-        else:  # allow 'tool' or any future role to pass
+        else:  # 'tool' etc. — allow
             cleaned.append(m)
     return cleaned
 
 
 def _normalize_sampling(body: Dict[str, Any]) -> None:
-    # temperature clamp to [0, 2] or default to 0.7
+    # temperature clamp to [0, 2] (default 0.7 if invalid)
     if "temperature" in body:
         t = body["temperature"]
         if not isinstance(t, (int, float)):
@@ -206,7 +210,7 @@ def _normalize_sampling(body: Dict[str, Any]) -> None:
             elif t > 2:
                 body["temperature"] = 2.0
 
-    # top_p must be in (0, 1]; if invalid (e.g., 0.0 or >1), set safe default 0.95
+    # top_p must be in (0, 1]; set to 0.95 if invalid (e.g., 0.0 or > 1)
     if "top_p" in body:
         p = body["top_p"]
         if not isinstance(p, (int, float)) or p <= 0 or p > 1:
@@ -229,7 +233,8 @@ def _filter_allowed_top_keys(body: Dict[str, Any]) -> Dict[str, Any]:
 
 def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     # Remove fields Venice doesn't accept on chat/completions
-    for k in ("stream_options", "tool_choice", "input", "max_output_tokens", "elevenlabs_extra_body", "response_format"):
+    for k in ("stream_options", "tool_choice", "input", "max_output_tokens",
+              "elevenlabs_extra_body", "response_format"):
         body.pop(k, None)
 
     # tools: keep only non-empty list; otherwise remove
@@ -241,14 +246,14 @@ def _strip_problem_fields(body: Dict[str, Any]) -> Dict[str, Any]:
     if body.get("user") is None:
         body.pop("user", None)
 
-    # Normalize/clean messages
+    # Normalize & clean messages
     msgs = body.get("messages")
     if isinstance(msgs, list) and msgs:
         msgs = _normalize_roles_and_prune(msgs)
         msgs = _coerce_messages_to_strings(msgs)
         body["messages"] = msgs
 
-    # Sampling normalization (fixes top_p=0.0, invalid temperature, etc.)
+    # Fix sampling
     _normalize_sampling(body)
 
     # Drop explicit None keys
@@ -265,8 +270,15 @@ def _build_chat_body(req: ChatRequest) -> Dict[str, Any]:
         "model": _normalize_model(req.model),
         "messages": [m.model_dump() for m in req.messages] if req.messages else [],
         "temperature": req.temperature,
-        "stream": False,  # force non-streaming for EL stability
+        "stream": bool(req.stream),  # pass through streaming intent
     }
+
+    # Map user_id -> user if provided (EL pattern)
+    if req.user:
+        body["user"] = req.user
+    elif req.user_id:
+        body["user"] = req.user_id
+
     if req.max_tokens is not None:
         body["max_tokens"] = req.max_tokens
     if req.top_p is not None:
@@ -319,9 +331,11 @@ def _as_openai(up_json: Dict[str, Any], model: str) -> Dict[str, Any]:
                     if content is None:
                         content = json.dumps(up_json, ensure_ascii=False)
                     c["message"] = {"role": role, "content": content}
-                for bad in ("refusal", "annotations", "audio", "function_call", "tool_calls", "reasoning_content", "stop_reason"):
+                for bad in ("refusal", "annotations", "audio", "function_call", "tool_calls",
+                            "reasoning_content", "stop_reason"):
                     c.pop(bad, None)
-            for bad in ("service_tier", "system_fingerprint", "prompt_logprobs", "kv_transfer_params", "venice_parameters"):
+            for bad in ("service_tier", "system_fingerprint", "prompt_logprobs",
+                        "kv_transfer_params", "venice_parameters"):
                 up_json.pop(bad, None)
         except Exception:
             return _wrap_minimal(up_json, model)
@@ -345,7 +359,7 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     body = _build_chat_body(req)
 
-    # Minimal log of inbound vs forwarded (safe)
+    # Minimal safe logging of inbound vs forwarded
     try:
         incoming = await request.json()
     except Exception:
@@ -367,6 +381,22 @@ async def chat_completions(req: ChatRequest, request: Request):
     headers = await _headers()
     t0 = time.perf_counter()
 
+    # If EL wants streaming, pass SSE through verbatim
+    if body.get("stream") is True:
+        async def stream_gen() -> AsyncIterator[bytes]:
+            try:
+                async with _client.stream("POST", VENICE_ENDPOINT, headers=headers, json=body) as r:
+                    logging.info("[proxy] POST %s -> %s (stream)", VENICE_ENDPOINT, r.status_code)
+                    async for chunk in r.aiter_raw():
+                        # Upstream emits SSE; pass through untouched
+                        yield chunk
+            except httpx.HTTPError as e:
+                logging.exception("Upstream stream error: %s", e)
+                # Emit a final SSE error line so EL can end the stream gracefully
+                yield b'data: {"error":"Upstream stream failed"}\n\n'
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
+
+    # Non-streaming path (single JSON)
     try:
         r = await _client.post(VENICE_ENDPOINT, headers=headers, json=body)
         dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -388,10 +418,8 @@ async def chat_completions(req: ChatRequest, request: Request):
             )
 
         txt = await r.aread()
-        logging.error(
-            "[proxy] upstream error %s in %dms: %s",
-            status, dt_ms, txt[:500].decode("utf-8", "ignore")
-        )
+        logging.error("[proxy] upstream error %s in %dms: %s",
+                      status, dt_ms, txt[:500].decode("utf-8", "ignore"))
         err = {
             "error": "Upstream failed",
             "detail": {
